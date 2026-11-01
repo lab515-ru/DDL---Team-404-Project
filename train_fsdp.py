@@ -59,6 +59,8 @@ STOP_FLAG = {"stop": False}
 # --------------------------------------------------------------------------- args
 def parse():
     p = argparse.ArgumentParser()
+    p.add_argument("--pos_weight", type=float, default=1.0)
+    p.add_argument("--fusion", default="mean", choices=["mean", "calibrated"])
     p.add_argument("--real_set", default="wildtrack", choices=["wildtrack", "multiviewx"])
     p.add_argument("--cache", default=None, help="packed .npy from cache_wildtrack.py")
     p.add_argument("--model", default="vit_base_patch16_224")
@@ -109,6 +111,11 @@ class MultiViewViT(nn.Module):
             nn.Conv2d(a.proj_ch, a.proj_ch, 3, padding=1), nn.ReLU(),
             nn.Conv2d(a.proj_ch, 1, 1))
         self.grid = (a.grid_h, a.grid_w)
+        self.geo = None
+        if getattr(a, "fusion", "mean") == "calibrated":
+            from geometry import make_geometry
+            self.geo = make_geometry(a.real_set, a.data_root, (a.img_h, a.img_w),
+                                     (a.grid_h, a.grid_w), (self.gh, self.gw))
 
     def encode(self, x):  # x: (N,3,H,W) -> (N,C,gh,gw)
         tok = self.encoder.forward_features(x)
@@ -117,12 +124,20 @@ class MultiViewViT(nn.Module):
         return self.proj(tok.transpose(1, 2).reshape(n, d, self.gh, self.gw))
 
     def fuse(self, f, b, v):
-        # STUB: mean over views, no calibration. Replace with per-camera homography /
-        # ground-plane projection using each site's calibration. Mean tolerates a variable
-        # number of cameras.
-        f = f.view(b, v, *f.shape[1:]).mean(1)
-        f = F.interpolate(f, size=self.grid, mode="bilinear", align_corners=False)
-        return self.head(f)
+        if self.geo is None:   # old placeholder
+            f = f.view(b, v, *f.shape[1:]).mean(1)
+            f = F.interpolate(f, size=self.grid, mode="bilinear", align_corners=False)
+            return self.head(f)
+        grid, mask = self.geo
+        dt = f.dtype
+        grid, mask = grid.to(f.device), mask.to(f.device)
+        s = F.grid_sample(f.float(), grid.repeat(b, 1, 1, 1), mode="bilinear",
+                          padding_mode="zeros", align_corners=False)
+        m = mask.repeat(b, 1, 1).unsqueeze(1)
+        s = (s * m).view(b, v, *s.shape[1:])
+        m = m.view(b, v, *m.shape[1:])
+        out = s.sum(1) / m.sum(1).clamp(min=1)
+        return self.head(out.to(dt))
 
     def forward(self, views):  # (B,V,3,H,W)
         b, v = views.shape[:2]
@@ -432,7 +447,9 @@ def main():
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         ev[0].record()
         logits = model(views)
-        loss = F.binary_cross_entropy_with_logits(logits.float(), target)
+        loss = F.binary_cross_entropy_with_logits(
+            logits.float(), target,
+            pos_weight=torch.tensor(a.pos_weight, device=logits.device))
         ev[1].record()
         loss.backward()
         ev[2].record()
