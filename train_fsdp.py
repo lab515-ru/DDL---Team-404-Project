@@ -283,8 +283,11 @@ def save_ckpt(model, opt, step, ckpt_dir, rank):
 
 def load_ckpt(model, opt, path):
     msd, osd = get_state_dict(model, opt)
+    pg = osd.pop("param_groups", None)
     sd = {"model": msd, "optim": osd}
     dcp.load(sd, checkpoint_id=str(path))
+    if pg is not None:
+        sd["optim"]["param_groups"] = pg
     set_state_dict(model, opt, model_state_dict=sd["model"], optim_state_dict=sd["optim"])
 
 
