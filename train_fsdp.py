@@ -59,9 +59,16 @@ STOP_FLAG = {"stop": False}
 # --------------------------------------------------------------------------- args
 def parse():
     p = argparse.ArgumentParser()
+    p.add_argument("--mmp_scene", default=None)
+    p.add_argument("--mmp_train", default="", help="comma list of cache stems")
+    p.add_argument("--mmp_val", default="")
+    p.add_argument("--epfl_root", default=None)
+    p.add_argument("--holdout", type=int, default=0, help="last N frames for validation")
+    p.add_argument("--gap", type=int, default=5, help="frames dropped between train and val")
+    p.add_argument("--eval_thr", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9])
     p.add_argument("--pos_weight", type=float, default=1.0)
     p.add_argument("--fusion", default="mean", choices=["mean", "calibrated"])
-    p.add_argument("--real_set", default="wildtrack", choices=["wildtrack", "multiviewx"])
+    p.add_argument("--real_set", default="wildtrack", choices=["wildtrack", "multiviewx", "mmptrack"])
     p.add_argument("--cache", default=None, help="packed .npy from cache_wildtrack.py")
     p.add_argument("--model", default="vit_base_patch16_224")
     p.add_argument("--pretrained_path", default=None, help="local timm weights file")
@@ -112,11 +119,17 @@ class MultiViewViT(nn.Module):
             nn.Conv2d(a.proj_ch, 1, 1))
         self.grid = (a.grid_h, a.grid_w)
         self.geo = None
+        self.geo = None
         if getattr(a, "fusion", "mean") == "calibrated":
-            from geometry import make_geometry
-            self.geo = make_geometry(a.real_set, a.data_root, (a.img_h, a.img_w),
-                                     (a.grid_h, a.grid_w), (self.gh, self.gw))
-
+            if a.real_set == "mmptrack":
+                from mmptrack import make_geometry_mmp
+                self.geo = make_geometry_mmp(a.data_root, a.mmp_scene, (a.img_h, a.img_w),
+                                             (a.grid_h, a.grid_w), (self.gh, self.gw))
+            else:
+                from geometry import make_geometry
+                self.geo = make_geometry(a.real_set, a.data_root, (a.img_h, a.img_w),
+                                         (a.grid_h, a.grid_w), (self.gh, self.gw))
+                
     def encode(self, x):  # x: (N,3,H,W) -> (N,C,gh,gw)
         tok = self.encoder.forward_features(x)
         tok = tok[:, self.encoder.num_prefix_tokens:]
@@ -162,6 +175,10 @@ class SyntheticMultiView(Dataset):
 
 class RealMultiView(Dataset):
     def __init__(self, a):
+        if a.real_set == "mmptrack":
+            from mmptrack import MMPDataset
+            self.ds = MMPDataset(a.data_root, a.mmp_scene, a.mmp_train.split(","), (a.img_h, a.img_w))
+            return
         if a.real_set == "multiviewx":
             from multiviewx import MultiviewXDataset
             self.ds = MultiviewXDataset(a.data_root, img_hw=(a.img_h, a.img_w),
@@ -349,9 +366,55 @@ def edge_central_bench(a):
     (out / "edge_central.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 
+@torch.no_grad()
+def evaluate(model, val_ds, a, rank):
+    """All ranks run the same frames (FSDP needs every rank in forward). Rank 0 scores."""
+    import numpy as np
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except Exception:
+        linear_sum_assignment = None
+    model.eval()
+    res = {t: [0, 0, 0] for t in a.eval_thr}
+    loss_sum = 0.0
+    for i in range(0, len(val_ds), 4):
+        items = [val_ds[j] for j in range(i, min(i + 4, len(val_ds)))]
+        v = torch.stack([x[0] for x in items]).cuda()
+        t = torch.stack([x[1] for x in items]).cuda()
+        logits = model(v).float()
+        loss_sum += F.binary_cross_entropy_with_logits(
+            logits, t, pos_weight=torch.tensor(a.pos_weight, device=t.device)).item() * len(items)
+        prob = torch.sigmoid(logits)
+        peak = (prob == F.max_pool2d(prob, 5, 1, 2))
+        for b in range(len(items)):
+            gt = t[b, 0].nonzero().float().cpu().numpy()
+            for thr in a.eval_thr:
+                pr = (peak[b, 0] & (prob[b, 0] > thr)).nonzero().float().cpu().numpy()
+                tp = 0
+                if len(gt) and len(pr):
+                    d = np.linalg.norm(pr[:, None] - gt[None], axis=2)
+                    if linear_sum_assignment:
+                        r, c = linear_sum_assignment(d)
+                        tp = int((d[r, c] <= 5).sum())
+                    else:
+                        tp = int(min((d.min(1) <= 5).sum(), len(gt)))
+                res[thr][0] += tp
+                res[thr][1] += len(pr) - tp
+                res[thr][2] += len(gt) - tp
+    model.train()
+    if rank != 0:
+        return None
+    out = {"val_loss": loss_sum / len(val_ds), "by_threshold": {}}
+    for thr, (tp, fp, fn) in res.items():
+        p = tp / max(tp + fp, 1); r = tp / max(tp + fn, 1)
+        out["by_threshold"][str(thr)] = {"precision": p, "recall": r,
+                                         "f1": 2 * p * r / max(p + r, 1e-9), "tp": tp, "fp": fp, "fn": fn}
+    return out
 
 # --------------------------------------------------------------------------- main
 def main():
+    import random; random.seed(0)
+    torch.manual_seed(0)
     a = parse()
     if a.bench_only:
         edge_central_bench(a)
@@ -399,6 +462,15 @@ def main():
 
     # data
     ds = SyntheticMultiView(a) if a.dataset == "synthetic" else RealMultiView(a)
+    val_ds = None
+    if a.holdout > 0:
+        from torch.utils.data import Subset
+        n = len(ds)
+        val_ds = Subset(ds, range(n - a.holdout, n))
+        ds = Subset(ds, range(0, n - a.holdout - a.gap))
+    if a.real_set == "mmptrack" and a.mmp_val:
+        from mmptrack import MMPDataset
+        val_ds = MMPDataset(a.data_root, a.mmp_scene, a.mmp_val.split(","), (a.img_h, a.img_w))
     sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
     loader = DataLoader(ds, batch_size=a.batch_per_gpu, sampler=sampler, shuffle=sampler is None,
                         num_workers=a.workers, pin_memory=True, drop_last=True,
@@ -505,6 +577,17 @@ def main():
             if rank == 0:
                 print("SIGUSR1: checkpoint saved, exiting for requeue")
             break
+    if val_ds is not None:
+        ev = evaluate(model, val_ds, a, rank)
+        if rank == 0:
+            (out / "eval.json").write_text(json.dumps(ev, indent=2))
+            print("EVAL", json.dumps(ev, indent=2), flush=True)
+    if a.epfl_root:
+        from epfl_rlc import evaluate_epfl
+        r = evaluate_epfl(model, a.epfl_root, rank)
+        if rank == 0:
+            (out / "epfl.json").write_text(json.dumps(r, indent=2))
+            print("EPFL", json.dumps(r), flush=True)
 
     # ---- summary
     wall = time.perf_counter() - t_seg

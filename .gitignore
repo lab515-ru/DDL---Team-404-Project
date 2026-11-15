@@ -4,3 +4,5 @@ __pycache__/
 *.pt
 logs/
 ckpt/
+*.bak
+*.bak*
