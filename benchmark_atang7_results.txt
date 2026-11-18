@@ -1,0 +1,51 @@
+step 20 loss 0.1015 step_s 0.064 (straggler gap 0.000s) mem 1.2GB
+step 30 loss 0.1020 step_s 0.070 (straggler gap 0.007s) mem 1.2GB
+step 40 loss 0.1011 step_s 0.071 (straggler gap 0.000s) mem 1.2GB
+step 50 loss 0.1048 step_s 0.070 (straggler gap 0.000s) mem 1.2GB
+{
+  "run": "atang7_fsdp_benchmark",
+  "model": "vit_base_patch16_224",
+  "params_M": 85.992385,
+  "world_size": 4,
+  "nodes": 1,
+  "segment_steps": 50,
+  "segment_wall_s": 10.343307316012215,
+  "node_hours_segment": 0.0028731409211145043,
+  "gpu_hours_segment": 0.011492563684458017,
+  "latency_s": {
+    "step_mean": 0.07351830837578746,
+    "step_p50": 0.07052002201089635,
+    "step_p95": 0.10822429199470207,
+    "data": 0.0001905234224977903,
+    "forward": 0.026803664112091063,
+    "backward": 0.04118375444412232,
+    "optimizer": 0.004803296828269959,
+    "data_wait_fraction": 0.0025915098797422457
+  },
+  "throughput_samples_per_s": 110.74145345499664,
+  "mfu": 0.061653986626293324,
+  "memory_GB": {
+    "peak_allocated_max_over_ranks": 1.1896954774856567,
+    "est_state_fsdp_per_gpu": 0.34396954,
+    "est_state_ddp_per_gpu": 1.37587816
+  },
+  "communication": {
+    "nccl_kernel_s_per_step_profiled": 0.08348911360000015,
+    "est_volume_bytes_per_step_fsdp": 386965732.5,
+    "est_volume_bytes_per_step_ddp_equiv": 515954310.0,
+    "effective_bw_GBps_vs_step_time": 5.263528786897978,
+    "effective_bw_GBps_vs_nccl_time": 4.634924432830478,
+    "nccl_microbench": {
+      "msg_MB": 256,
+      "allreduce_ms": 1.9969354994827881,
+      "allreduce_busbw_GBps": 201.63554812075216,
+      "allgather_ms": 1.1368567502358928,
+      "allgather_busbw_GBps": 177.09055424812811,
+      "reducescatter_ms": 1.0537116002524272,
+      "reducescatter_busbw_GBps": 191.06422663636826
+    }
+  },
+  "gpu_util_pct_mean": 26.047619047619047,
+  "gpu_mem_ctrl_util_pct_mean": 3.238095238095238,
+  "note": "NCCL kernel time includes waiting on peers and overlaps with compute; it upper-bounds pure transfer time. FLOPs estimate is 6*params*tokens."
+}
