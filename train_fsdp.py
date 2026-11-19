@@ -36,6 +36,7 @@ import os
 import signal
 import threading
 import time
+import random
 from functools import partial
 from pathlib import Path
 
@@ -59,6 +60,15 @@ STOP_FLAG = {"stop": False}
 # --------------------------------------------------------------------------- args
 def parse():
     p = argparse.ArgumentParser()
+    p.add_argument("--multi", action="store_true")
+    p.add_argument("--domains", default="all")
+    p.add_argument("--mmp_cache", default=None)
+    p.add_argument("--wt_root", default=None); p.add_argument("--wt_cache", default=None)
+    p.add_argument("--mx_root", default=None); p.add_argument("--mx_cache", default=None)
+    p.add_argument("--dom_holdout", type=int, default=40)
+    p.add_argument("--eval_split", default="val", choices=["val", "test"])
+    p.add_argument("--val_stride", type=int, default=1)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--mmp_scene", default=None)
     p.add_argument("--mmp_train", default="", help="comma list of cache stems")
     p.add_argument("--mmp_val", default="")
@@ -118,9 +128,9 @@ class MultiViewViT(nn.Module):
             nn.Conv2d(a.proj_ch, a.proj_ch, 3, padding=1), nn.ReLU(),
             nn.Conv2d(a.proj_ch, 1, 1))
         self.grid = (a.grid_h, a.grid_w)
+        self.geos = None
         self.geo = None
-        self.geo = None
-        if getattr(a, "fusion", "mean") == "calibrated":
+        if getattr(a, "fusion", "mean") == "calibrated" and not getattr(a, "multi", False):
             if a.real_set == "mmptrack":
                 from mmptrack import make_geometry_mmp
                 self.geo = make_geometry_mmp(a.data_root, a.mmp_scene, (a.img_h, a.img_w),
@@ -136,25 +146,27 @@ class MultiViewViT(nn.Module):
         n, _, d = tok.shape
         return self.proj(tok.transpose(1, 2).reshape(n, d, self.gh, self.gw))
 
-    def fuse(self, f, b, v):
-        if self.geo is None:   # old placeholder
+    def fuse(self, f, b, v, geo=None):
+        geo = geo if geo is not None else self.geo
+        if geo is None:
             f = f.view(b, v, *f.shape[1:]).mean(1)
             f = F.interpolate(f, size=self.grid, mode="bilinear", align_corners=False)
             return self.head(f)
-        grid, mask = self.geo
+        grid, mask = geo
         dt = f.dtype
         grid, mask = grid.to(f.device), mask.to(f.device)
+        H, W = grid.shape[1:3]
         s = F.grid_sample(f.float(), grid.repeat(b, 1, 1, 1), mode="bilinear",
                           padding_mode="zeros", align_corners=False)
         m = mask.repeat(b, 1, 1).unsqueeze(1)
         s = (s * m).view(b, v, *s.shape[1:])
         m = m.view(b, v, *m.shape[1:])
-        out = s.sum(1) / m.sum(1).clamp(min=1)
-        return self.head(out.to(dt))
+        return self.head((s.sum(1) / m.sum(1).clamp(min=1)).to(dt))
 
-    def forward(self, views):  # (B,V,3,H,W)
+    def forward(self, views, dom=0):       # (B,V,3,H,W)
         b, v = views.shape[:2]
-        return self.fuse(self.encode(views.flatten(0, 1)), b, v)
+        geo = self.geos[dom] if self.geos is not None else None
+        return self.fuse(self.encode(views.flatten(0, 1)), b, v, geo)
 
 
 # --------------------------------------------------------------------------- data
@@ -367,7 +379,7 @@ def edge_central_bench(a):
     print(json.dumps(report, indent=2))
 
 @torch.no_grad()
-def evaluate(model, val_ds, a, rank):
+def evaluate(model, val_ds, a, rank, dom=0):
     """All ranks run the same frames (FSDP needs every rank in forward). Rank 0 scores."""
     import numpy as np
     try:
@@ -381,7 +393,7 @@ def evaluate(model, val_ds, a, rank):
         items = [val_ds[j] for j in range(i, min(i + 4, len(val_ds)))]
         v = torch.stack([x[0] for x in items]).cuda()
         t = torch.stack([x[1] for x in items]).cuda()
-        logits = model(v).float()
+        logits = model(v, dom).float()
         loss_sum += F.binary_cross_entropy_with_logits(
             logits, t, pos_weight=torch.tensor(a.pos_weight, device=t.device)).item() * len(items)
         prob = torch.sigmoid(logits)
@@ -413,9 +425,12 @@ def evaluate(model, val_ds, a, rank):
 
 # --------------------------------------------------------------------------- main
 def main():
-    import random; random.seed(0)
-    torch.manual_seed(0)
     a = parse()
+    random.seed(a.seed); torch.manual_seed(a.seed)
+    doms = None
+    if a.multi:
+        from domains import build_domains
+        doms = build_domains(a)
     if a.bench_only:
         edge_central_bench(a)
         return
@@ -431,6 +446,8 @@ def main():
 
     # model
     model = MultiViewViT(a)
+    if doms:
+        model.geos = [d.geo for d in doms]
     n_params = sum(p.numel() for p in model.parameters())
     n_enc = sum(p.numel() for p in model.encoder.parameters())
     model = model.cuda()
@@ -461,21 +478,33 @@ def main():
             sched.step()
 
     # data
-    ds = SyntheticMultiView(a) if a.dataset == "synthetic" else RealMultiView(a)
-    val_ds = None
-    if a.holdout > 0:
-        from torch.utils.data import Subset
-        n = len(ds)
-        val_ds = Subset(ds, range(n - a.holdout, n))
-        ds = Subset(ds, range(0, n - a.holdout - a.gap))
-    if a.real_set == "mmptrack" and a.mmp_val:
-        from mmptrack import MMPDataset
-        val_ds = MMPDataset(a.data_root, a.mmp_scene, a.mmp_val.split(","), (a.img_h, a.img_w))
-    sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
-    loader = DataLoader(ds, batch_size=a.batch_per_gpu, sampler=sampler, shuffle=sampler is None,
-                        num_workers=a.workers, pin_memory=True, drop_last=True,
-                        persistent_workers=a.workers > 0)
+    if a.multi:
+        import math
+        from domains import MultiDS, MultiDomainBatchSampler
+        ds = MultiDS(doms)
+        sizes = [len(d.train) for d in doms]
+        bsamp = MultiDomainBatchSampler(sizes, [math.sqrt(s) for s in sizes], a.batch_per_gpu,
+                                        rank, world, a.steps, start, a.seed)
+        loader = DataLoader(ds, batch_sampler=bsamp, num_workers=a.workers, pin_memory=True,
+                            persistent_workers=a.workers > 0)
+        sampler, val_ds = None, None
+    else:
+        ds = SyntheticMultiView(a) if a.dataset == "synthetic" else RealMultiView(a)
+        val_ds = None
+        if a.holdout > 0:
+            from torch.utils.data import Subset
+            n = len(ds)
+            val_ds = Subset(ds, range(n - a.holdout, n))
+            ds = Subset(ds, range(0, n - a.holdout - a.gap))
+        if a.real_set == "mmptrack" and a.mmp_val:
+            from mmptrack import MMPDataset
+            val_ds = MMPDataset(a.data_root, a.mmp_scene, a.mmp_val.split(","), (a.img_h, a.img_w))
+        sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
+        loader = DataLoader(ds, batch_size=a.batch_per_gpu, sampler=sampler, shuffle=sampler is None,
+                            num_workers=a.workers, pin_memory=True, drop_last=True,
+                            persistent_workers=a.workers > 0)
     it, epoch = iter(loader), 0
+
 
     # constants for estimates
     n_tok = model.module.gh * model.module.gw if hasattr(model, "module") else 0
@@ -506,19 +535,21 @@ def main():
 
         t0 = time.perf_counter()
         try:
-            views, target = next(it)
+            batch = next(it)
         except StopIteration:
             epoch += 1
             if sampler is not None:
                 sampler.set_epoch(epoch)
             it = iter(loader)
-            views, target = next(it)
+            batch = next(it)
+        views, target = batch[0], batch[1]
+        dom = int(batch[2][0]) if len(batch) > 2 else 0
         data_s = time.perf_counter() - t0
         views, target = views.cuda(non_blocking=True), target.cuda(non_blocking=True)
 
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         ev[0].record()
-        logits = model(views)
+        logits = model(views, dom)
         loss = F.binary_cross_entropy_with_logits(
             logits.float(), target,
             pos_weight=torch.tensor(a.pos_weight, device=logits.device))
@@ -550,7 +581,7 @@ def main():
 
         if rank == 0:
             jsonl.write(json.dumps({
-                "step": step, "loss": loss.item(), "data_s": data_s, "fwd_s": fwd, "bwd_s": bwd,
+                "step": step, "loss": loss.item(), "data_s": data_s, "fwd_s": fwd, "bwd_s": bwd, "dom": dom,
                 "opt_s": opt_s, "step_s": total, "peak_mem_GB": torch.cuda.max_memory_allocated() / 1e9,
             }) + "\n")
             jsonl.flush()
@@ -577,11 +608,24 @@ def main():
             if rank == 0:
                 print("SIGUSR1: checkpoint saved, exiting for requeue")
             break
-    if val_ds is not None:
-        ev = evaluate(model, val_ds, a, rank)
+    if a.multi:
+        from torch.utils.data import Subset
+        allv = {}
+        for di, d in enumerate(doms):
+            vs = getattr(d, a.eval_split)
+            if vs is None or len(vs) == 0:
+                continue
+            vs = Subset(vs, range(0, len(vs), a.val_stride))
+            ev = evaluate(model, vs, a, rank, dom=di)
+            if rank == 0:
+                allv[d.name] = ev
         if rank == 0:
-            (out / "eval.json").write_text(json.dumps(ev, indent=2))
-            print("EVAL", json.dumps(ev, indent=2), flush=True)
+            macro = {t: sum(v["by_threshold"][t]["f1"] for v in allv.values()) / len(allv)
+                     for t in next(iter(allv.values()))["by_threshold"]}
+            (out / "eval_multi.json").write_text(json.dumps({"domains": allv, "macro_f1": macro}, indent=2))
+            print("EVALMULTI macro F1 by threshold", {t: round(x, 3) for t, x in macro.items()})
+            for n, v in allv.items():
+                print("EVALMULTI", n, {t: round(x["f1"], 3) for t, x in v["by_threshold"].items()})
     if a.epfl_root:
         from epfl_rlc import evaluate_epfl
         r = evaluate_epfl(model, a.epfl_root, rank)

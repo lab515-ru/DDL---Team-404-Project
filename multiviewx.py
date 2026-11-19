@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from wildtrack import rodrigues, _floats, project
 
 NCAM = 6
-GRID_W, GRID_H = 640, 1000  # labeling grid (guess: X-first); verify with the test
+GRID_W, GRID_H = 1000, 640  # 1000 cols (X) x 640 rows (Y)
 
 
 def load_calib_mx(root):
